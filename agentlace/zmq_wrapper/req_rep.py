@@ -33,19 +33,134 @@ class ReqRepServer:
         logging.basicConfig(level=log_level)
         logging.debug(f"Req-rep server is listening on port {port}")
 
+    def reset_socket(self):
+        """Reset the ZMQ socket if it's in a bad state"""
+        try:
+            if self.socket:
+                try:
+                    # Try to unbind first if possible
+                    self.socket.unbind(f"tcp://*:{self.port}")
+                except zmq.ZMQError:
+                    pass  # Socket might not be bound
+                self.socket.close()
+                self.socket = None
+                time.sleep(0.1)  # Give OS time to free up the port
+
+            # Create new socket
+            self.socket = self.context.socket(zmq.REP)
+            self.socket.setsockopt(zmq.LINGER, 0)
+            self.socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
+            self.socket.setsockopt(zmq.RECONNECT_IVL, 100)  # 100ms reconnect interval
+            self.socket.setsockopt(zmq.RECONNECT_IVL_MAX, 1000)  # 1s max reconnect interval
+            
+            try:
+                self.socket.bind(f"tcp://*:{self.port}")
+            except zmq.ZMQError as e:
+                if e.errno == zmq.EADDRINUSE:
+                    # Port is still in use, try to force close the context and recreate
+                    logging.warning(f"Port {self.port} still in use, recreating context...")
+                    self.context.term()
+                    time.sleep(0.2)  # Give more time for cleanup
+                    self.context = zmq.Context()
+                    self.socket = self.context.socket(zmq.REP)
+                    self.socket.setsockopt(zmq.LINGER, 0)
+                    self.socket.setsockopt(zmq.RCVTIMEO, 1000)
+                    self.socket.bind(f"tcp://*:{self.port}")
+                else:
+                    raise
+            
+            logging.debug(f"Reset socket on port {self.port}")
+        except Exception as e:
+            logging.error(f"Failed to reset socket: {str(e)}")
+            # If we completely failed to reset, sleep and let caller retry
+            time.sleep(1)
+            raise
+
+    def receive_complete_message(self):
+        """Receive a complete message with timeout and validation"""
+        try:
+            # Use NOBLOCK to avoid hanging
+            message = self.socket.recv(flags=zmq.NOBLOCK)
+            if not message:  # Sanity check for empty messages
+                logging.warning("Received empty message")
+                return None
+            return message
+        except zmq.Again:
+            # No message available
+            return None
+        except Exception as e:
+            logging.error(f"Error receiving message: {str(e)}")
+            return None
+
     def run(self):
         if self.is_kill:
             logging.debug("Server is prev killed, reseting...")
             self.reset()
+        
+        consecutive_errors = 0
+        max_reset_attempts = 3
+        reset_attempt = 0
+        poll_timeout = 1000  # 1 second timeout
+        
         while not self.is_kill:
             try:
-                #  Wait for next request from client
-                message = self.socket.recv()
-                message = self.decompress(message)
-                logging.debug(f"Received new request: {message}")
+                poller = zmq.Poller()
+                poller.register(self.socket, zmq.POLLIN)
+                
+                while not self.is_kill:
+                    try:
+                        # Use poller to handle timeouts gracefully
+                        socks = dict(poller.poll(poll_timeout))
+                        if self.socket not in socks or socks[self.socket] != zmq.POLLIN:
+                            continue
 
-                #  Send reply back to client
-                if self.impl_callback:
+                        message = self.receive_complete_message()
+                        if message is None:
+                            continue
+
+                        logging.debug(f"Received raw message of length: {len(message)} bytes")
+                        try:
+                            message = self.decompress(message)
+                            logging.debug(f"Successfully decompressed message: {message}")
+                            consecutive_errors = 0
+                            reset_attempt = 0  # Reset attempt counter on success
+                        except Exception as e:
+                            logging.error(f"Failed to decompress message: {str(e)}")
+                            if len(message) > 0:
+                                logging.debug(f"First 100 bytes of raw message: {message[:100]}")
+                            consecutive_errors += 1
+                            if consecutive_errors >= 3:
+                                raise  # Let outer try block handle reset
+                            # Send error response to client to maintain REQ-REP state
+                            error_response = self.compress({"error": str(e)})
+                            self.socket.send(error_response)
+                            continue
+
+                        #  Send reply back to client
+                        if self.impl_callback:
+                            res = self.impl_callback(message)
+                            res = self.compress(res)
+                            self.socket.send(res)
+                        else:
+                            logging.warning("No implementation callback provided.")
+                            self.socket.send(b"World")
+                    except zmq.Again as e:
+                        logging.warning(f"Socket timeout: {str(e)}")
+                        continue
+            except Exception as e:
+                logging.error(f"Error in main loop, attempting socket reset: {str(e)}")
+                try:
+                    self.reset_socket()
+                    reset_attempt += 1
+                    if reset_attempt >= max_reset_attempts:
+                        logging.error("Max reset attempts reached, server will exit")
+                        self.stop()
+                        raise
+                    time.sleep(1)  # Wait before retrying
+                except Exception as reset_error:
+                    logging.error(f"Failed to reset socket: {str(reset_error)}")
+                    self.stop()
+                    raise
                     res = self.impl_callback(message)
                     res = self.compress(res)
                     self.socket.send(res)
