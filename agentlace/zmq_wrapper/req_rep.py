@@ -22,13 +22,15 @@ class ReqRepServer:
                  port=5556,
                  impl_callback: Optional[CallbackProtocol] = None,
                  log_level=logging.DEBUG,
-                 compression: str = 'lz4'):
+                 compression: str = 'lz4',
+                 timeout_ms: int = 1000):
         """
         Request reply server
         """
         self.impl_callback = impl_callback
         self.compress, self.decompress = make_compression_method(compression)
         self.port = port
+        self._timeout = timeout_ms
         self.reset()
         logging.basicConfig(level=log_level)
         logging.debug(f"Req-rep server is listening on port {port}")
@@ -48,10 +50,10 @@ class ReqRepServer:
 
             # Create new socket
             self.socket = self.context.socket(zmq.REP)
-            self.socket.setsockopt(zmq.LINGER, 0)
-            self.socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
-            self.socket.setsockopt(zmq.RECONNECT_IVL, 100)  # 100ms reconnect interval
-            self.socket.setsockopt(zmq.RECONNECT_IVL_MAX, 1000)  # 1s max reconnect interval
+            self.socket.setsockopt(zmq.LINGER, 0)  # when closing, don't wait for pending messages
+            self.socket.setsockopt(zmq.RCVTIMEO, self._timeout)  # if no message received within this time, op timeout instead of blocking
+            self.socket.setsockopt(zmq.RECONNECT_IVL, 100)  # if connection is lost, wait this amount of time (ms) before reconnecting
+            self.socket.setsockopt(zmq.RECONNECT_IVL_MAX, 1000)  # this (in ms) caps the exponential backoff strategy for reconnections
             
             try:
                 self.socket.bind(f"tcp://*:{self.port}")
@@ -64,7 +66,7 @@ class ReqRepServer:
                     self.context = zmq.Context()
                     self.socket = self.context.socket(zmq.REP)
                     self.socket.setsockopt(zmq.LINGER, 0)
-                    self.socket.setsockopt(zmq.RCVTIMEO, 1000)
+                    self.socket.setsockopt(zmq.RCVTIMEO, self._timeout)
                     self.socket.bind(f"tcp://*:{self.port}")
                 else:
                     raise
@@ -76,7 +78,7 @@ class ReqRepServer:
             time.sleep(1)
             raise
 
-    def receive_complete_message(self):
+    def _receive_complete_message(self):
         """Receive a complete message with timeout and validation"""
         try:
             # Use NOBLOCK to avoid hanging
@@ -100,7 +102,6 @@ class ReqRepServer:
         consecutive_errors = 0
         max_reset_attempts = 3
         reset_attempt = 0
-        poll_timeout = 1000  # 1 second timeout
         
         while not self.is_kill:
             try:
@@ -110,11 +111,11 @@ class ReqRepServer:
                 while not self.is_kill:
                     try:
                         # Use poller to handle timeouts gracefully
-                        socks = dict(poller.poll(poll_timeout))
+                        socks = dict(poller.poll(self._timeout))
                         if self.socket not in socks or socks[self.socket] != zmq.POLLIN:
                             continue
 
-                        message = self.receive_complete_message()
+                        message = self._receive_complete_message()
                         if message is None:
                             continue
 
