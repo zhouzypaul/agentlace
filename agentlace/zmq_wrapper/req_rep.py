@@ -94,7 +94,78 @@ class ReqRepServer:
             logging.error(f"Error receiving message: {str(e)}")
             return None
 
+    def _handle_exception(self, e, reset_attempt, max_reset_attempts, consecutive_errors=None):
+        """Handle different types of exceptions in a centralized way
+        
+        Args:
+            e: The exception that was raised
+            reset_attempt: Current reset attempt count
+            max_reset_attempts: Maximum number of reset attempts allowed
+            consecutive_errors: Optional counter for consecutive decompression errors
+            
+        Returns:
+            Tuple of (should_continue, new_reset_attempt, new_consecutive_errors)
+        """
+        # Handle different exception types
+        if isinstance(e, zmq.Again):
+            # Socket timeout, just continue
+            logging.warning(f"Socket timeout: {str(e)}")
+            return True, reset_attempt, consecutive_errors
+            
+        elif isinstance(e, zmq.ZMQError):
+            # Handle ZMQ-specific errors
+            if self.is_kill:
+                logging.debug("Stopping the ZMQ server...")
+                return False, reset_attempt, consecutive_errors  # Exit the loop
+            else:
+                # For other ZMQ errors, attempt socket reset
+                logging.error(f"ZMQ error, attempting socket reset: {str(e)}")
+        
+        else:  # General exception
+            logging.error(f"Error in main loop, attempting socket reset: {str(e)}")
+        
+        # For non-Again exceptions, try to reset the socket
+        try:
+            self.reset_socket()
+            reset_attempt += 1
+            if reset_attempt >= max_reset_attempts:
+                logging.error("Max reset attempts reached, server will exit")
+                self.stop()
+                raise Exception("Max reset attempts reached") from e
+            time.sleep(1)  # Wait before retrying
+            return True, reset_attempt, 0 if consecutive_errors is not None else None
+        except Exception as reset_error:
+            logging.error(f"Failed to reset socket: {str(reset_error)}")
+            self.stop()
+            raise reset_error
+    
+    def _handle_decompression_error(self, e, message, consecutive_errors):
+        """Handle decompression errors
+        
+        Args:
+            e: The exception that was raised
+            message: The raw message that failed to decompress
+            consecutive_errors: Counter for consecutive decompression errors
+            
+        Returns:
+            New consecutive_errors count
+        """
+        logging.error(f"Failed to decompress message: {str(e)}")
+        if len(message) > 0:
+            logging.debug(f"First 100 bytes of raw message: {message[:100]}")
+        
+        consecutive_errors += 1
+        if consecutive_errors >= 3:
+            raise Exception("Too many consecutive decompression errors") from e
+        
+        # Send error response to client to maintain REQ-REP state
+        error_response = self.compress({"error": str(e)})
+        self.socket.send(error_response)
+        
+        return consecutive_errors
+
     def run(self):
+        """Main server loop that processes incoming messages"""
         if self.is_kill:
             logging.debug("Server is prev killed, reseting...")
             self.reset()
@@ -126,15 +197,7 @@ class ReqRepServer:
                             consecutive_errors = 0
                             reset_attempt = 0  # Reset attempt counter on success
                         except Exception as e:
-                            logging.error(f"Failed to decompress message: {str(e)}")
-                            if len(message) > 0:
-                                logging.debug(f"First 100 bytes of raw message: {message[:100]}")
-                            consecutive_errors += 1
-                            if consecutive_errors >= 3:
-                                raise  # Let outer try block handle reset
-                            # Send error response to client to maintain REQ-REP state
-                            error_response = self.compress({"error": str(e)})
-                            self.socket.send(error_response)
+                            consecutive_errors = self._handle_decompression_error(e, message, consecutive_errors)
                             continue
 
                         #  Send reply back to client
@@ -145,38 +208,15 @@ class ReqRepServer:
                         else:
                             logging.warning("No implementation callback provided.")
                             self.socket.send(b"World")
-                    except zmq.Again as e:
-                        logging.warning(f"Socket timeout: {str(e)}")
-                        continue
+                    except Exception as e:
+                        should_continue, reset_attempt, _ = self._handle_exception(e, reset_attempt, max_reset_attempts)
+                        if not should_continue:
+                            break
             except Exception as e:
-                logging.error(f"Error in main loop, attempting socket reset: {str(e)}")
-                try:
-                    self.reset_socket()
-                    reset_attempt += 1
-                    if reset_attempt >= max_reset_attempts:
-                        logging.error("Max reset attempts reached, server will exit")
-                        self.stop()
-                        raise
-                    time.sleep(1)  # Wait before retrying
-                except Exception as reset_error:
-                    logging.error(f"Failed to reset socket: {str(reset_error)}")
-                    self.stop()
-                    raise
-                    res = self.impl_callback(message)
-                    res = self.compress(res)
-                    self.socket.send(res)
-                else:
-                    logging.warning("No implementation callback provided.")
-                    self.socket.send(b"World")
-            except zmq.Again as e:
-                continue
-            except zmq.ZMQError as e:
-                # Handle ZMQ errors gracefully
-                if self.is_kill:
-                    logging.debug("Stopping the ZMQ server...")
+                should_continue, reset_attempt, consecutive_errors = self._handle_exception(
+                    e, reset_attempt, max_reset_attempts, consecutive_errors)
+                if not should_continue:
                     break
-                else:
-                    raise e
 
     def stop(self):
         self.is_kill = True
