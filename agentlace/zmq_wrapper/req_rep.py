@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import zmq
+import time
 import argparse
 from typing import Optional, Dict
 from typing_extensions import Protocol
