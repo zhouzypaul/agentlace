@@ -269,23 +269,29 @@ class ReqRepClient:
         Reset the socket connection, this is needed when REQ is in a
         broken state.
         """
-        try:
-            if self.socket:
-                self.socket.close()
+        with self._internal_lock:  # Ensure thread safety during reset
+            try:
+                if self.socket:
+                    self.socket.close(linger=0)  # Force immediate close
+                    self.socket = None
+            except Exception as e:
+                logging.warning(f"Error closing socket: {e}")
                 self.socket = None
-        except Exception as e:
-            logging.warning(f"Error closing socket: {e}")
-            self.socket = None
             
-        try:
-            self.socket = self.context.socket(zmq.REQ)
-            self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
-            self.socket.setsockopt(zmq.LINGER, 0)  # Don't wait on close
-            self.socket.connect(f"tcp://{self.ip}:{self.port}")
-        except Exception as e:
-            logging.error(f"Failed to create new socket: {e}")
-            self.socket = None
-            raise
+            # Add small delay to ensure proper cleanup
+            time.sleep(0.05)
+            
+            try:
+                self.socket = self.context.socket(zmq.REQ)
+                self.socket.setsockopt(zmq.RCVTIMEO, self.timeout_ms)
+                self.socket.setsockopt(zmq.SNDTIMEO, self.timeout_ms)  # Add send timeout
+                self.socket.setsockopt(zmq.LINGER, 0)  # Don't wait on close
+                self.socket.connect(f"tcp://{self.ip}:{self.port}")
+                logging.debug(f"Successfully reset and reconnected to {self.ip}:{self.port}")
+            except Exception as e:
+                logging.error(f"Failed to create new socket: {e}")
+                self.socket = None
+                raise
 
     def send_msg(self, request: dict, wait_for_response=True) -> Optional[str]:
         if self.socket is None:

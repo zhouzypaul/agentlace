@@ -131,25 +131,8 @@ class ActionClient:
             :param wait_for_server: Whether to retry connecting to the server
         """
         self.client = ReqRepClient(server_ip, config.port_number, timeout_ms=timeout_ms)
-        res = self.client.send_msg({"type": "hash"})
-
-        # Retry to connect to the server if not connected
-        if wait_for_server:
-            while res is None:
-                logging.error(f"Failed to connect to action server of "
-                            f"{server_ip}:{config.port_number}. Retrying...")
-                time.sleep(2)
-                res = self.client.send_msg({"type": "hash"})
-
-        if res is None:
-            raise Exception("Failed to connect to action server")
-
-        # Check hash of server config to ensure compatibility
-        config_json = json.dumps(asdict(config), separators=(',', ':'))
-        if compute_hash(config_json) != compute_hash(res["payload"]):
-            raise Exception(
-                f"Incompatible config with hash with server. "
-                "Please check the config of the server and client")
+        self._wait_for_server = wait_for_server
+        res = self._verify_server_connection()
 
         # use hash for faster lookup. config uses list because it is
         # used for hash md5 comparison
@@ -158,6 +141,53 @@ class ActionClient:
         self.config = config
         self.server_ip = server_ip
         self.broadcast_client = None
+
+    def _verify_server_connection(self):
+        """Verify connection to server and handle retries"""
+        res = self.client.send_msg({"type": "hash"})
+
+        # Retry to connect to the server if not connected
+        if self._wait_for_server:
+            while res is None:
+                logging.error(f"Failed to connect to action server of "
+                            f"{self.server_ip}:{self.config.port_number}. Retrying...")
+                time.sleep(2)
+                # Reset client socket to ensure clean reconnection
+                self.client.reset_socket()
+                res = self.client.send_msg({"type": "hash"})
+
+        if res is None:
+            raise Exception("Failed to connect to action server")
+
+        # Check hash of server config to ensure compatibility
+        config_json = json.dumps(asdict(self.config), separators=(',', ':'))
+        if compute_hash(config_json) != compute_hash(res["payload"]):
+            raise Exception(
+                f"Incompatible config with hash with server. "
+                "Please check the config of the server and client")
+        
+        return res
+
+    def _send_with_retry(self, message, max_retries=3):
+        """Send message with automatic retry and reconnection on failure"""
+        for attempt in range(max_retries):
+            result = self.client.send_msg(message)
+            if result is not None:
+                return result
+            
+            # Connection failed, try to reconnect
+            logging.warning(f"Connection failed on attempt {attempt + 1}, trying to reconnect...")
+            try:
+                self.client.reset_socket()
+                # Verify we can still connect to server
+                self._verify_server_connection()
+            except Exception as e:
+                if attempt == max_retries - 1:  # Last attempt
+                    logging.error(f"Failed to reconnect after {max_retries} attempts: {e}")
+                    raise
+                time.sleep(1)  # Wait before next retry
+        
+        return None
 
     def obs(self, keys: Optional[Set[str]] = None) -> Optional[dict]:
         """
@@ -170,8 +200,8 @@ class ActionClient:
         else:
             for key in keys:
                 assert key in self.config.observation_keys, f"Invalid obs key: {key}"
-        messsage = {"type": "obs", "keys": keys}
-        return self.client.send_msg(messsage)
+        message = {"type": "obs", "keys": keys}
+        return self._send_with_retry(message)
 
     def act(self, key: str, payload: dict = {}) -> Optional[dict]:
         """
@@ -183,7 +213,7 @@ class ActionClient:
         if key not in self.config.action_keys:
             raise Exception(f"Invalid action key: {key}")
         message = {"type": "act", "key": key, "payload": payload}
-        return self.client.send_msg(message)
+        return self._send_with_retry(message)
 
     def register_obs_callback(self, callback: Callable):
         """
